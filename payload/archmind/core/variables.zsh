@@ -1,0 +1,29 @@
+# ==========================================
+# ArchMind Core Variables
+# Internal default values
+# ==========================================
+
+export ARCHMIND_NAME="${ARCHMIND_NAME:-ArchMind}"
+export ARCHMIND_VERSION="1.5.18"
+export ARCHMIND_CODENAME="Cyber Interface"
+
+export ARCHMIND_HOME="${ARCHMIND_HOME:-$HOME/ArchMind/System/Core}"
+export ARCHMIND_DATA_HOME="${ARCHMIND_DATA_HOME:-$HOME/ArchMind}"
+export ARCHMIND_USER_CONFIG="${ARCHMIND_USER_CONFIG:-$ARCHMIND_DATA_HOME/Config}"
+export ARCHMIND_SHELL="${ARCHMIND_SHELL:-zsh}"
+export ARCHMIND_AUTHOR="${ARCHMIND_AUTHOR:-ArchMind contributors}"
+export ARCHMIND_MOTTO="${ARCHMIND_MOTTO:-Intelligence meets Linux}"
+
+export ARCHMIND_THEME="${ARCHMIND_THEME:-cyber}"
+export ARCHMIND_AI="${ARCHMIND_AI:-Ollama}"
+export ARCHMIND_AI_DEFAULT_MODEL="${ARCHMIND_AI_DEFAULT_MODEL:-qwen2.5-coder:7b}"
+
+export ARCHMIND_STARTUP_ENABLED="${ARCHMIND_STARTUP_ENABLED:-true}"
+export ARCHMIND_STARTUP_FASTFETCH="${ARCHMIND_STARTUP_FASTFETCH:-true}"
+export ARCHMIND_STARTUP_CLEAR="${ARCHMIND_STARTUP_CLEAR:-false}"
+
+export ARCHMIND_CONFIRM_ACTIONS="${ARCHMIND_CONFIRM_ACTIONS:-true}"
+export ARCHMIND_AUTO_UPDATE_CHECK="${ARCHMIND_AUTO_UPDATE_CHECK:-false}"
+
+export ARCHMIND_VENV_DIR="${ARCHMIND_VENV_DIR:-.venv}"
+export ARCHMIND_EDITOR="${ARCHMIND_EDITOR:-${EDITOR:-nano}}"

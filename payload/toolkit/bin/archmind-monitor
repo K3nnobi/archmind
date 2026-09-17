@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+core="${ARCHMIND_ROOT:-$HOME/ArchMind/System/Core}"
+command -v python3 >/dev/null 2>&1 || {
+    printf '%s\n' 'ArchMind Monitor requires Python 3.10+ (Arch package: python).' >&2
+    exit 1
+}
+[[ -r "$core/tools/live-monitor.py" ]] || {
+    printf '%s\n' 'ArchMind Monitor was not found. Reinstall the current ArchMind package.' >&2
+    exit 1
+}
+exec python3 -B "$core/tools/live-monitor.py" "$@"

@@ -1,0 +1,51 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+readonly VERSION="1.5.18"
+readonly ARCHMIND_ROOT="${ARCHMIND_ROOT:-$HOME/ArchMind/System/Core}"
+readonly CONSOLE_MAIN="$ARCHMIND_ROOT/console/main.zsh"
+
+show_error() {
+    printf '\nArchMind: %s\n\n' "$1" >&2
+}
+
+run_console() {
+    if ! command -v zsh >/dev/null 2>&1; then
+    show_error "Zsh is not installed. On Arch Linux, run: sudo pacman -S zsh"
+        exit 1
+    fi
+
+    if [[ ! -r "$CONSOLE_MAIN" ]]; then
+    show_error "AFI Console was not found at: $CONSOLE_MAIN"
+        exit 1
+    fi
+
+    exec zsh "$CONSOLE_MAIN"
+}
+
+case "${1:-}" in
+    ""|--console|console)
+        shift $(( $# > 0 ? 1 : 0 ))
+        run_console "$@"
+        ;;
+
+    --version|-v)
+        printf 'ArchMind %s (AFI)\n' "$VERSION"
+        ;;
+
+    --help|-h)
+        cat <<'HELP'
+Usage:
+  archmind-console          Open the main AFI interface
+  archmind                  Compatible command for the same interface
+  archmind-console --version
+  archmind-console --help
+HELP
+        ;;
+
+    *)
+        show_error "unknown option: $1"
+        printf 'Use: archmind-console --help\n' >&2
+        exit 2
+        ;;
+esac

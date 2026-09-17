@@ -1,0 +1,8 @@
+#!/usr/bin/env zsh
+
+typeset -g ARCHMIND_AI_MODEL="qwen2.5-coder:7b"
+typeset -g ARCHMIND_BACKUP_DIR="${ARCHMIND_BACKUP_DIR:-$HOME/ArchMind/Backups}"
+typeset -g ARCHMIND_PYTHON_PROJECT="${ARCHMIND_PYTHON_PROJECT:-$HOME/ArchMind/Projects}"
+typeset -g ARCHMIND_CONSOLE_MARGIN=2
+typeset -g ARCHMIND_CONSOLE_MIN_WIDTH=40
+typeset -g ARCHMIND_SAFE_CONFIRMATIONS=true

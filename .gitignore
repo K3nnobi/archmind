@@ -1,0 +1,15 @@
+__pycache__/
+*.pyc
+*.pyo
+*.bak
+*.backup-*
+*.log
+*.archmind
+.env
+.env.*
+Backups/
+Installer-Backups/
+Logs/
+State/
+/ArchMind-*.tar.gz
+/ArchMind-*-Installer.run

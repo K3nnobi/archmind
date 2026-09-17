@@ -1,0 +1,2517 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+IFS=$'\n\t'
+
+APP="archmind-manager"
+VERSION="1.5.18"
+
+ROOT_DIR="${HOME}/ArchMind"
+SYSTEM_DIR="${ROOT_DIR}/System"
+BACKUP_DIR="${ROOT_DIR}/Backups"
+PROJECT_DIR="${ARCHMIND_PROJECT_DIR:-${SYSTEM_DIR}/Core}"
+CONFIG_DIR="${ROOT_DIR}/Config"
+ZSH_CONFIG_DIR="${CONFIG_DIR}/Zsh"
+ALIASES_FILE="${ZSH_CONFIG_DIR}/aliases.zsh"
+P10K_FILE="${ZSH_CONFIG_DIR}/p10k.zsh"
+SAFETY_DIR="${BACKUP_DIR}/Safety"
+TEMP_DIR="${ROOT_DIR}/Temp"
+LOG_DIR="${ROOT_DIR}/Logs"
+
+USER_EXT_DIR="${HOME}/.local/share/gnome-shell/extensions"
+NAUTILUS_HELPER="${PROJECT_DIR}/tools/configure-nautilus.sh"
+GNOME_APPEARANCE_HELPER="${PROJECT_DIR}/tools/configure-gnome-appearance.sh"
+GAMEMODE_BLUR_HELPER="${PROJECT_DIR}/tools/configure-gamemode-blur.sh"
+GNOME_DRAG_HOVER_HELPER="${PROJECT_DIR}/tools/configure-gnome-drag-hover.py"
+WINE_COMPATIBILITY_HELPER="${PROJECT_DIR}/tools/configure-wine-compatibility.sh"
+CAPSLOCK_NODELAY_HELPER="${PROJECT_DIR}/tools/configure-capslock-nodelay.sh"
+FIREFOX_EMOJI_HELPER="${PROJECT_DIR}/tools/configure-firefox-chatgpt-emoji.py"
+NVIBRANT_HELPER="${PROJECT_DIR}/tools/configure-nvibrant.sh"
+PLYMOUTH_PATCH_HELPER="${PROJECT_DIR}/patches/plymouth/plymouth-patch.sh"
+MAINTENANCE_TOOLS_DIR="${PROJECT_DIR}/tools"
+
+info()  { printf '\033[1;34m[INFO]\033[0m %s\n' "$*"; }
+ok()    { printf '\033[1;32m[ OK ]\033[0m %s\n' "$*"; }
+warn()  { printf '\033[1;33m[WARNING]\033[0m %s\n' "$*"; }
+error() { printf '\033[1;31m[ERROR]\033[0m %s\n' "$*" >&2; }
+die()   { error "$*"; exit 1; }
+
+has() {
+  command -v "$1" >/dev/null 2>&1
+}
+
+pause() {
+  echo
+  read -rp "Press Enter to continue..." _
+}
+
+confirm() {
+  local answer
+  read -rp "$1 [y/N]: " answer
+  [[ "${answer,,}" == "y" || "${answer,,}" == "yes" ]]
+}
+
+header() {
+  clear
+  cat <<EOF
+╔══════════════════════════════════════════════╗
+║          ArchMind Manager ${VERSION}              ║
+╚══════════════════════════════════════════════╝
+EOF
+  echo
+}
+
+ensure_dirs() {
+  mkdir -p "$BACKUP_DIR" "$PROJECT_DIR" "$CONFIG_DIR" "$ZSH_CONFIG_DIR" \
+    "$SAFETY_DIR" "$TEMP_DIR" "$LOG_DIR"
+}
+
+require_normal_user() {
+  [[ "$EUID" -ne 0 ]] || die "Run as your normal user, not as root."
+}
+
+require_arch() {
+  [[ -f /etc/arch-release ]] || die "Este script requer Arch Linux ou derivado."
+  has pacman || die "pacman was not found."
+}
+
+latest_backup() {
+  local pattern="$1"
+
+  find "$BACKUP_DIR" -maxdepth 1 -type f -name "$pattern" \
+    -printf '%T@ %p\n' 2>/dev/null \
+    | sort -nr \
+    | head -n1 \
+    | cut -d' ' -f2-
+}
+
+make_temp_dir() {
+  mktemp -d "${TEMP_DIR}/archmind.XXXXXX"
+}
+
+create_checksums() {
+  local dir="$1"
+
+  (
+    cd "$dir"
+    find . -type f ! -name 'checksums.sha256' -print0 \
+      | sort -z \
+      | xargs -0 sha256sum > checksums.sha256
+  )
+}
+
+pack_archmind() {
+  local source="$1"
+  local destination="$2"
+
+  create_checksums "$source"
+  (
+    unset TAR_OPTIONS
+    command tar \
+      -C "$source" \
+      --create \
+      --auto-compress \
+      --file="$destination" \
+      --exclude='*.sock' \
+      --warning=no-file-ignored \
+      .
+  )
+  sha256sum "$destination" > "${destination}.sha256"
+
+  ok "File created: $destination"
+}
+
+is_safe_archive_path() {
+  local path="$1"
+
+  # Backups created by ArchMind use relative names beginning with "./".
+  # Backslashes are refused so control names escaped by the tar listing are
+  # never interpreted as ordinary paths.
+  [[ -n "$path" ]] || return 1
+  [[ "$path" != /* ]] || return 1
+  [[ "$path" != *\\* ]] || return 1
+  [[ "$path" != *$'\r'* && "$path" != *$'\n'* ]] || return 1
+  [[ ! "$path" =~ (^|/)\.\.(/|$) ]] || return 1
+
+  return 0
+}
+
+validate_archive_paths() {
+  local source="$1"
+  local listing entry
+
+  [[ -f "$source" ]] || die "Backup file not found: $source"
+
+  listing="$(mktemp "${TEMP_DIR}/archive-list.XXXXXX")" \
+    || die "Could not create the temporary backup list."
+
+  if ! (
+    unset TAR_OPTIONS
+    command tar --list --file="$source" --quoting-style=escape
+  ) > "$listing"; then
+    rm -f -- "$listing"
+    die "Could not read the backup structure."
+  fi
+
+  while IFS= read -r entry || [[ -n "$entry" ]]; do
+    if ! is_safe_archive_path "$entry"; then
+      rm -f -- "$listing"
+      die "Unsafe path detected in the backup: $entry"
+    fi
+  done < "$listing"
+
+  rm -f -- "$listing"
+}
+
+validate_checksum_paths() {
+  local checksum_file="$1"
+  local line hash separator path
+
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    [[ -n "$line" ]] || continue
+
+    hash="${line:0:64}"
+    separator="${line:64:2}"
+    path="${line:66}"
+
+    if [[ ! "$hash" =~ ^[[:xdigit:]]{64}$ ]] \
+      || [[ "$separator" != "  " && "$separator" != " *" ]] \
+      || ! is_safe_archive_path "$path"; then
+      die "Invalid or unsafe entry in checksums.sha256."
+    fi
+  done < "$checksum_file"
+}
+
+validate_extracted_layout() {
+  local dir="$1"
+  local component
+
+  for component in configs gnome packages project; do
+    if [[ -e "${dir}/${component}" || -L "${dir}/${component}" ]]; then
+      [[ -d "${dir}/${component}" && ! -L "${dir}/${component}" ]] \
+        || die "Invalid backup component: $component"
+    fi
+  done
+}
+
+remove_temp_dir() {
+  local dir="${1:-}"
+
+  case "$dir" in
+    "${TEMP_DIR}"/archmind.*)
+      [[ -e "$dir" ]] && rm -rf -- "$dir"
+      ;;
+    *)
+      error "Refused to remove a temporary directory outside ArchMind: $dir"
+      return 1
+      ;;
+  esac
+}
+
+extract_archmind() {
+  local source="$1"
+  local destination
+
+  validate_archive_paths "$source"
+  destination="$(make_temp_dir)"
+
+  if ! (
+    unset TAR_OPTIONS
+    command tar \
+      --extract \
+      --file="$source" \
+      --directory="$destination" \
+      --no-same-owner \
+      --delay-directory-restore
+  ); then
+    remove_temp_dir "$destination" || true
+    die "Backup extraction failed. No restoration was started."
+  fi
+
+  printf '%s\n' "$destination"
+}
+
+verify_extracted() {
+  local dir="$1"
+
+  [[ -f "${dir}/manifest.txt" && ! -L "${dir}/manifest.txt" ]] \
+    || die "Missing or invalid manifest."
+  [[ -f "${dir}/checksums.sha256" && ! -L "${dir}/checksums.sha256" ]] \
+    || die "Missing or invalid hashes."
+
+  validate_extracted_layout "$dir"
+  validate_checksum_paths "${dir}/checksums.sha256"
+
+  (
+    cd "$dir"
+    sha256sum -c -- checksums.sha256 >/dev/null
+  ) || die "The backup is corrupted or incomplete."
+}
+
+copy_home_path_to_safety() {
+  local destination="$1"
+  local relative="$2"
+  local source="${HOME}/${relative}"
+  local target="${destination}/${relative}"
+
+  [[ -e "$source" || -L "$source" ]] || return 0
+
+  mkdir -p "$(dirname "$target")"
+
+  if [[ -d "$source" && ! -L "$source" ]]; then
+    # Tar preserves permissions and ignores temporary sockets (for example,
+    # libvirt monitor.sock), which cannot and must not be restored.
+    (
+      cd "$HOME"
+      unset TAR_OPTIONS
+      command tar \
+        --create \
+        --file=- \
+        --warning=no-file-ignored \
+        -- "$relative"
+    ) | (
+      cd "$destination"
+      unset TAR_OPTIONS
+      command tar \
+        --extract \
+        --file=- \
+        --no-same-owner \
+        --delay-directory-restore
+    )
+  else
+    cp -a -- "$source" "$target"
+  fi
+}
+
+backup_safety() {
+  local destination="${SAFETY_DIR}/before-restore-$(date +'%Y%m%d-%H%M%S')"
+  local relative
+  local home_paths=(
+    ".config"
+    ".bashrc"
+    ".bash_profile"
+    ".zshrc"
+    ".zprofile"
+    ".zshenv"
+    ".p10k.zsh"
+    ".zsh_aliases"
+    ".profile"
+    ".gitconfig"
+    ".gtkrc-2.0"
+    ".Xresources"
+    ".vimrc"
+    ".nanorc"
+    ".tmux.conf"
+    ".themes"
+    ".icons"
+    ".fonts"
+    ".local/share/themes"
+    ".local/share/icons"
+    ".local/share/fonts"
+    ".local/share/thumbnailers"
+    ".local/share/gnome-shell/extensions"
+    ".local/bin"
+    "ArchMind/Config"
+  )
+
+  mkdir -p -m 700 "$destination"
+
+  for relative in "${home_paths[@]}"; do
+    copy_home_path_to_safety "$destination" "$relative"
+  done
+
+  # Keep a second organized copy of files loaded by Zsh, including those
+  # outside ~/.config and the standard hidden filenames.
+  capture_zsh_dependencies "${destination}/zsh-dependencies"
+
+  has dconf && dconf dump / > "${destination}/full.dconf" 2>/dev/null || true
+
+  ok "Safety copy: $destination"
+}
+
+is_ignored_zsh_file() {
+  local file="$1"
+  local base
+  base="$(basename "$file")"
+
+  case "$base" in
+    .zsh_history|.bash_history|*.backup|*.bak|*.old|*.tmp)
+      return 0
+      ;;
+  esac
+
+  return 1
+}
+
+normalize_home_path() {
+  local raw="$1"
+
+  raw="${raw%%#*}"
+  raw="${raw%;}"
+  raw="${raw%\"}"
+  raw="${raw#\"}"
+  raw="${raw%\'}"
+  raw="${raw#\'}"
+
+  raw="${raw/#\~/$HOME}"
+  raw="${raw//\$\{HOME\}/$HOME}"
+  raw="${raw//\$HOME/$HOME}"
+
+  [[ "$raw" == /* ]] || raw="${HOME}/${raw#./}"
+
+  realpath -m -- "$raw"
+}
+
+detect_zsh_dependencies() {
+  local config line candidate normalized
+  local configs=(
+    "${HOME}/.zshrc"
+    "${HOME}/.zprofile"
+    "${HOME}/.zshenv"
+  )
+
+  {
+    local standard
+    for standard in \
+      "${HOME}/.zshrc" \
+      "${HOME}/.zprofile" \
+      "${HOME}/.zshenv" \
+      "${HOME}/.p10k.zsh" \
+      "${HOME}/.zsh_aliases"; do
+      [[ -f "$standard" ]] && printf '%s\n' "$standard"
+    done
+
+    for config in "${configs[@]}"; do
+      [[ -f "$config" ]] || continue
+
+      while IFS= read -r line; do
+        candidate=""
+
+        if [[ "$line" =~ (^|[[:space:];&])source[[:space:]]+([^[:space:];&]+) ]]; then
+          candidate="${BASH_REMATCH[2]}"
+        elif [[ "$line" =~ (^|[[:space:];&])\.[[:space:]]+([^[:space:];&]+) ]]; then
+          candidate="${BASH_REMATCH[2]}"
+        fi
+
+        [[ -n "$candidate" ]] || continue
+        normalized="$(normalize_home_path "$candidate")"
+
+        [[ "$normalized" == "${HOME}/"* ]] || continue
+        [[ -f "$normalized" ]] || continue
+        is_ignored_zsh_file "$normalized" && continue
+
+        printf '%s\n' "$normalized"
+      done < "$config"
+    done
+
+    find "$HOME" -maxdepth 1 -type f \
+      \( -name '*.zsh' -o -name '.zsh_*' \) \
+      ! -name '.zsh_history' \
+      ! -name '*.backup' \
+      ! -name '*.bak' \
+      -print 2>/dev/null
+  } | sort -u
+}
+
+capture_zsh_dependencies() {
+  local target="$1"
+  local list="${target}/zsh-files.txt"
+  local file relative destination
+
+  mkdir -p "${target}/zsh-linked"
+  detect_zsh_dependencies > "$list"
+
+  while IFS= read -r file; do
+    [[ -f "$file" ]] || continue
+    relative="${file#${HOME}/}"
+    destination="${target}/zsh-linked/${relative}"
+    mkdir -p "$(dirname "$destination")"
+    cp -a -- "$file" "$destination"
+  done < "$list"
+}
+
+show_detected_zsh_files() {
+  echo "Detected Zsh files:"
+  echo
+
+  local count=0 file
+  while IFS= read -r file; do
+    [[ -n "$file" ]] || continue
+    printf '  %s\n' "$file"
+    count=$((count + 1))
+  done < <(detect_zsh_dependencies)
+
+  echo
+  echo "Total: $count file(s)."
+  echo
+  echo "History and .backup/.bak files are ignored."
+}
+
+import_zsh_modules_to_project() {
+  ensure_dirs
+
+  local destination="${PROJECT_DIR}/modules/imported"
+  local safety="${SAFETY_DIR}/zsh-project-before-import-$(date +'%Y%m%d-%H%M%S')"
+  local file base copied=0
+
+  mkdir -p "$destination"
+
+  if [[ -n "$(find "$destination" -mindepth 1 -print -quit 2>/dev/null)" ]]; then
+    mkdir -p "$safety"
+    cp -a "${destination}/." "$safety/"
+    ok "Safety copy of existing modules: $safety"
+  fi
+
+  while IFS= read -r file; do
+    [[ -f "$file" ]] || continue
+    base="$(basename "$file")"
+
+    case "$base" in
+      .zshrc|.zprofile|.zshenv|.p10k.zsh|.zsh_aliases)
+        continue
+        ;;
+    esac
+
+    cp -a -- "$file" "${destination}/${base}"
+    copied=$((copied + 1))
+  done < <(detect_zsh_dependencies)
+
+  cat > "${destination}/loader.zsh" <<'EOF'
+# ArchMind Zsh module loader
+# Load every .zsh module in this directory except this loader itself.
+
+ARCHMIND_ZSH_DIR="${HOME}/ArchMind/Config/Zsh/modules"
+
+for module in "${ARCHMIND_ZSH_DIR}"/*.zsh; do
+  [[ -f "$module" ]] || continue
+  [[ "$(basename "$module")" == "loader.zsh" ]] && continue
+  source "$module"
+done
+
+unset module ARCHMIND_ZSH_DIR
+EOF
+
+  cat > "${destination}/README.txt" <<'EOF'
+This directory contains copies of custom Zsh modules.
+
+The importer does not delete or modify original files in Home.
+
+To start using these modules, add this to ~/.zshrc:
+
+[[ -f "$HOME/ArchMind/Config/Zsh/modules/loader.zsh" ]] && \
+  source "$HOME/ArchMind/Config/Zsh/modules/loader.zsh"
+
+Before doing so, remove or comment out old lines that load the same modules
+to prevent them from being executed twice.
+EOF
+
+  ok "$copied module(s) copied to: $destination"
+  warn "The originals were not deleted and ~/.zshrc was not modified."
+}
+
+capture_configs() {
+  local target="$1"
+  mkdir -p "$target"
+
+  local files=(
+    ".bashrc"
+    ".bash_profile"
+    ".zshrc"
+    ".zprofile"
+    ".zshenv"
+    ".p10k.zsh"
+    ".zsh_aliases"
+    ".profile"
+    ".gitconfig"
+    ".gtkrc-2.0"
+    ".Xresources"
+    ".vimrc"
+    ".nanorc"
+    ".tmux.conf"
+  )
+
+  local file
+  for file in "${files[@]}"; do
+    [[ -e "${HOME}/${file}" ]] || continue
+    case "$file" in
+      .zsh_aliases|.p10k.zsh)
+        # Store actual configuration, never an absolute compatibility link.
+        cp -aL -- "${HOME}/${file}" "$target/"
+        ;;
+      *) cp -a -- "${HOME}/${file}" "$target/" ;;
+    esac
+  done
+
+  capture_zsh_dependencies "$target"
+
+  if [[ -d "$CONFIG_DIR" ]]; then
+    mkdir -p "${target}/archmind-config"
+    cp -a -- "$CONFIG_DIR/." "${target}/archmind-config/"
+  fi
+
+  if [[ -f "$PROJECT_DIR/tools/doctor-report.py" ]] && has python3; then
+    python3 -B "$PROJECT_DIR/tools/doctor-report.py" --export "$target/archmind-doctor-reports" || \
+      warn "Doctor reports could not be fully included in the backup."
+  elif [[ -d "$LOG_DIR/Doctor" ]]; then
+    warn "Doctor reports were not backed up: the report helper or Python is missing."
+  fi
+
+  if [[ -d "${HOME}/.config" ]]; then
+    mkdir -p "${target}/.config"
+
+    if has rsync; then
+      rsync -a \
+        --exclude='archmind/' \
+        --exclude='Cache/' \
+        --exclude='cache/' \
+        --exclude='GPUCache/' \
+        --exclude='Code Cache/' \
+        --exclude='logs/' \
+        --exclude='Logs/' \
+        --exclude='*.sock' \
+        --exclude='google-chrome/' \
+        --exclude='chromium/' \
+        --exclude='BraveSoftware/' \
+        --exclude='discord/' \
+        --exclude='TelegramDesktop/' \
+        "${HOME}/.config/" "${target}/.config/"
+    else
+      local config_item config_name
+      while IFS= read -r -d '' config_item; do
+        config_name="$(basename "$config_item")"
+        [[ "$config_name" == "archmind" ]] && continue
+        cp -a -- "$config_item" "${target}/.config/"
+      done < <(find "${HOME}/.config" -mindepth 1 -maxdepth 1 -print0)
+    fi
+  fi
+
+  local path
+  for path in \
+    ".themes" \
+    ".icons" \
+    ".fonts" \
+    ".local/share/themes" \
+    ".local/share/icons" \
+    ".local/share/fonts" \
+    ".local/share/thumbnailers" \
+    ".local/bin"; do
+
+    if [[ "$path" == ".local/bin" && -d "${HOME}/${path}" ]]; then
+      mkdir -p "${target}/${path}"
+      local bin_item bin_name
+      while IFS= read -r -d '' bin_item; do
+        bin_name="$(basename "$bin_item")"
+        [[ "$bin_name" == "archmind" || "$bin_name" == "archmind-console" || "$bin_name" == "archmind-monitor" ]] && continue
+        cp -a -- "$bin_item" "${target}/${path}/"
+      done < <(find "${HOME}/${path}" -mindepth 1 -maxdepth 1 -print0)
+    elif [[ -e "${HOME}/${path}" ]]; then
+      mkdir -p "$(dirname "${target}/${path}")"
+      cp -a "${HOME}/${path}" "${target}/${path}"
+    fi
+  done
+}
+
+configure_nautilus_integration() {
+  if [[ ! -f "$NAUTILUS_HELPER" ]]; then
+    warn "Nautilus configurator not found: $NAUTILUS_HELPER"
+    return 0
+  fi
+
+  if ! bash "$NAUTILUS_HELPER" --apply; then
+    warn "The optional Nautilus integration failed; ArchMind will continue normally."
+  fi
+
+  return 0
+}
+
+configure_gnome_appearance_integration() {
+  if [[ ! -f "$GNOME_APPEARANCE_HELPER" ]]; then
+    warn "GNOME appearance configurator not found: $GNOME_APPEARANCE_HELPER"
+    return 0
+  fi
+
+  if ! bash "$GNOME_APPEARANCE_HELPER" --apply; then
+    warn "The optional GNOME appearance integration failed; ArchMind will continue normally."
+  fi
+
+  return 0
+}
+
+configure_gamemode_blur_integration() {
+  if [[ ! -f "$GAMEMODE_BLUR_HELPER" ]]; then
+    warn "GameMode + Blur configurator not found: $GAMEMODE_BLUR_HELPER"
+    return 0
+  fi
+
+  if ! bash "$GAMEMODE_BLUR_HELPER" --apply; then
+    warn "The optional GameMode + Blur integration failed; ArchMind will continue normally."
+  fi
+
+  return 0
+}
+
+open_gamemode_blur_integration() {
+  if [[ ! -f "$GAMEMODE_BLUR_HELPER" ]]; then
+    warn "GameMode + Blur configurator not found: $GAMEMODE_BLUR_HELPER"
+    return 0
+  fi
+
+  bash "$GAMEMODE_BLUR_HELPER" --menu || \
+    warn "The GameMode + Blur action was not completed."
+}
+
+open_gnome_drag_hover() {
+  if [[ ! -f "$GNOME_DRAG_HOVER_HELPER" || -L "$GNOME_DRAG_HOVER_HELPER" ]]; then
+    warn "GNOME Drag Hover helper not found: $GNOME_DRAG_HOVER_HELPER"
+    return 1
+  fi
+  has python3 || {
+    warn "Python 3 is required for GNOME Drag Hover."
+    return 1
+  }
+  python3 -B "$GNOME_DRAG_HOVER_HELPER" --menu || \
+    warn "The GNOME Drag Hover action was not completed."
+}
+
+open_wine_compatibility_pack() {
+  if [[ ! -f "$WINE_COMPATIBILITY_HELPER" ]]; then
+    warn "Wine Compatibility Pack not found: $WINE_COMPATIBILITY_HELPER"
+    return 1
+  fi
+  bash "$WINE_COMPATIBILITY_HELPER" --menu || \
+    warn "The Wine Compatibility Pack action was not completed."
+}
+
+open_capslock_nodelay() {
+  if [[ ! -f "$CAPSLOCK_NODELAY_HELPER" || -L "$CAPSLOCK_NODELAY_HELPER" ]]; then
+    warn "Caps Lock No Delay not found: $CAPSLOCK_NODELAY_HELPER"
+    return 1
+  fi
+  bash "$CAPSLOCK_NODELAY_HELPER" --menu || \
+    warn "The Caps Lock No Delay action was not completed."
+}
+
+open_firefox_chatgpt_emoji() {
+  if [[ ! -f "$FIREFOX_EMOJI_HELPER" || -L "$FIREFOX_EMOJI_HELPER" ]]; then
+    warn "Firefox / ChatGPT emoji helper not found: $FIREFOX_EMOJI_HELPER"
+    return 1
+  fi
+  python3 -B "$FIREFOX_EMOJI_HELPER" --menu || \
+    warn "The Firefox / ChatGPT emoji action was not completed."
+}
+
+configure_nvibrant_integration() {
+  if [[ ! -f "$NVIBRANT_HELPER" ]]; then
+    warn "NVIDIA Vibrance configurator not found: $NVIBRANT_HELPER"
+    return 0
+  fi
+  bash "$NVIBRANT_HELPER" --apply || \
+    warn "NVIDIA Vibrance was not applied; ArchMind will continue normally."
+}
+
+open_nvibrant_integration() {
+  [[ -f "$NVIBRANT_HELPER" ]] || { warn "NVIDIA Vibrance configurator not found."; return 0; }
+  bash "$NVIBRANT_HELPER" --menu || warn "The NVIDIA Vibrance action was not completed."
+}
+
+open_plymouth_patch() {
+  [[ -f "$PLYMOUTH_PATCH_HELPER" ]] || { warn "Plymouth patch not found."; return 0; }
+  bash "$PLYMOUTH_PATCH_HELPER" --menu || warn "The Plymouth action was not completed."
+}
+
+run_maintenance_tool() {
+  local tool="$1"
+  shift
+  has python3 || { warn "Python 3 is required for Maintenance Center."; return 1; }
+  [[ -f "$MAINTENANCE_TOOLS_DIR/$tool" ]] || { warn "Missing tool: $tool"; return 1; }
+  ARCHMIND_DATA_HOME="$ROOT_DIR" ARCHMIND_BACKUP_DIR="$BACKUP_DIR" \
+    python3 -B "$MAINTENANCE_TOOLS_DIR/$tool" "$@"
+}
+
+maintenance_menu() {
+  local choice
+  while true; do
+    header
+    cat <<'EOF'
+
+MAINTENANCE CENTER
+
+1) Hardware profile
+2) Update Guardian
+3) Tarefas pendentes
+4) Rollback Center
+5) Limpeza segura
+6) Backup catalog
+7) Operating profiles
+
+0) Back
+EOF
+    read -rp "> " choice
+    case "$choice" in
+      1) run_maintenance_tool hardware-profile.py; pause ;;
+      2) run_maintenance_tool update-guardian.py; pause ;;
+      3) run_maintenance_tool pending-tasks.py --interactive; pause ;;
+      4) run_maintenance_tool rollback-center.py --interactive; pause ;;
+      5) run_maintenance_tool cleanup-audit.py --interactive; pause ;;
+      6) run_maintenance_tool backup-catalog.py --interactive; pause ;;
+      7) run_maintenance_tool operating-profiles.py --interactive; pause ;;
+      0) return ;;
+      *) warn "Invalid option."; pause ;;
+    esac
+  done
+}
+
+capture_gnome() {
+  local target="$1"
+  mkdir -p "${target}/extensions" "${target}/dconf"
+
+  if [[ -d "$USER_EXT_DIR" ]]; then
+    cp -a "${USER_EXT_DIR}/." "${target}/extensions/"
+  fi
+
+  if has gnome-extensions; then
+    gnome-extensions list | sort > "${target}/extensions-all.txt"
+    gnome-extensions list --enabled | sort > "${target}/extensions-enabled.txt"
+    gnome-extensions list --disabled | sort > "${target}/extensions-disabled.txt"
+  fi
+
+  if has dconf; then
+    dconf dump /org/gnome/shell/ \
+      > "${target}/dconf/gnome-shell.dconf" 2>/dev/null || true
+
+    dconf dump /org/gnome/shell/extensions/ \
+      > "${target}/dconf/extensions.dconf" 2>/dev/null || true
+
+    dconf dump /org/gnome/desktop/interface/ \
+      > "${target}/dconf/interface.dconf" 2>/dev/null || true
+
+    dconf dump /org/gnome/desktop/background/ \
+      > "${target}/dconf/background.dconf" 2>/dev/null || true
+
+    dconf dump /org/gnome/desktop/wm/preferences/ \
+      > "${target}/dconf/window-manager.dconf" 2>/dev/null || true
+  fi
+}
+
+capture_packages() {
+  local target="$1"
+  mkdir -p "$target"
+
+  pacman -Q > "${target}/pacman-all.txt"
+  pacman -Qqe > "${target}/pacman-explicit.txt"
+  pacman -Qqen > "${target}/pacman-native.txt"
+  pacman -Qqem > "${target}/pacman-aur.txt"
+
+  has flatpak && \
+    flatpak list --app --columns=application \
+      > "${target}/flatpak-apps.txt" 2>/dev/null || true
+}
+
+capture_project() {
+  local target="$1"
+  mkdir -p "$target"
+
+  if [[ -z "$(find "$PROJECT_DIR" -mindepth 1 -print -quit 2>/dev/null)" ]]; then
+    warn "The project directory is empty: $PROJECT_DIR"
+  else
+    cp -a "${PROJECT_DIR}/." "$target/"
+  fi
+}
+
+create_backup() {
+  require_arch
+  ensure_dirs
+
+  local mode="$1"
+  local stamp work output
+
+  stamp="$(date +'%Y%m%d-%H%M%S')"
+  work="$(make_temp_dir)"
+  output="${BACKUP_DIR}/ArchMind-${mode}-${stamp}.archmind"
+
+  info "Creating backup: $mode"
+
+  case "$mode" in
+    completo)
+      capture_configs "${work}/configs"
+      capture_gnome "${work}/gnome"
+      capture_packages "${work}/packages"
+      capture_project "${work}/project"
+      ;;
+    configuracoes)
+      capture_configs "${work}/configs"
+      ;;
+    gnome)
+      capture_gnome "${work}/gnome"
+      ;;
+    pacotes)
+      capture_packages "${work}/packages"
+      ;;
+    projeto)
+      capture_project "${work}/project"
+      ;;
+    *)
+      remove_temp_dir "$work"
+      die "Invalid mode."
+      ;;
+  esac
+
+  local pacman_count=0 aur_count=0 flatpak_count=0 extension_count=0
+  [[ -f "${work}/packages/pacman-native.txt" ]] && pacman_count="$(grep -cve '^$' "${work}/packages/pacman-native.txt" || true)"
+  [[ -f "${work}/packages/pacman-aur.txt" ]] && aur_count="$(grep -cve '^$' "${work}/packages/pacman-aur.txt" || true)"
+  [[ -f "${work}/packages/flatpak-apps.txt" ]] && flatpak_count="$(grep -cve '^$' "${work}/packages/flatpak-apps.txt" || true)"
+  [[ -f "${work}/gnome/extensions-all.txt" ]] && extension_count="$(grep -cve '^$' "${work}/gnome/extensions-all.txt" || true)"
+
+  cat > "${work}/manifest.txt" <<EOF
+format=archmind
+version=${VERSION}
+mode=${mode}
+created=$(date --iso-8601=seconds)
+hostname=${HOSTNAME:-unknown}
+user=${USER}
+pacman_packages=${pacman_count}
+aur_packages=${aur_count}
+flatpak_apps=${flatpak_count}
+gnome_extensions=${extension_count}
+has_configs=$([[ -d "${work}/configs" ]] && echo yes || echo no)
+has_gnome=$([[ -d "${work}/gnome" ]] && echo yes || echo no)
+has_packages=$([[ -d "${work}/packages" ]] && echo yes || echo no)
+has_project=$([[ -d "${work}/project" ]] && echo yes || echo no)
+EOF
+
+  pack_archmind "$work" "$output"
+  remove_temp_dir "$work"
+}
+
+ensure_home_destination_writable() {
+  local destination="$1"
+
+  [[ -e "$destination" || -L "$destination" ]] || return 0
+  [[ -w "$destination" ]] && return 0
+
+  warn "Permission denied while overwriting: $destination"
+  if ! confirm "Change ownership of this path to ${USER}?"; then
+    error "Restoration stopped to avoid changing a path without permission."
+    return 1
+  fi
+
+  sudo chown -R "${USER}:$(id -gn)" -- "$destination" || {
+    error "Could not correct ownership of: $destination"
+    return 1
+  }
+}
+
+restore_home_item() {
+  local source="$1"
+  local destination="$2"
+
+  ensure_home_destination_writable "$destination" || return 1
+  mkdir -p -- "$(dirname "$destination")"
+
+  if [[ -d "$source" && ! -L "$source" ]]; then
+    mkdir -p -- "$destination"
+    cp -a -- "$source/." "$destination/"
+  else
+    cp -a -- "$source" "$destination"
+  fi || {
+    error "Failed to restore: $destination"
+    return 1
+  }
+}
+
+restore_config_tree() {
+  local source="$1"
+  local item name
+
+  mkdir -p "${HOME}/.config"
+  while IFS= read -r -d '' item; do
+    name="$(basename "$item")"
+
+    # The project is restored in its own step. Backups 1.4.1 and older also
+    # stored it inside configs/.config; copying it here could reintroduce the
+    # defective Manager during restoration itself.
+    [[ "$name" == "archmind" ]] && continue
+
+    restore_home_item "$item" "${HOME}/.config/${name}" || return 1
+  done < <(find "$source" -mindepth 1 -maxdepth 1 -print0)
+}
+
+restore_local_tree() {
+  local source="$1"
+  local item name bin_item bin_name share_item share_name
+
+  mkdir -p "${HOME}/.local"
+  while IFS= read -r -d '' item; do
+    name="$(basename "$item")"
+
+    if [[ "$name" == "bin" && -d "$item" ]]; then
+      mkdir -p "${HOME}/.local/bin"
+      while IFS= read -r -d '' bin_item; do
+        bin_name="$(basename "$bin_item")"
+        [[ "$bin_name" == "archmind" || "$bin_name" == "archmind-console" || "$bin_name" == "archmind-monitor" ]] && continue
+        restore_home_item "$bin_item" "${HOME}/.local/bin/${bin_name}" || return 1
+      done < <(find "$item" -mindepth 1 -maxdepth 1 -print0)
+      continue
+    fi
+
+    if [[ "$name" == "share" && -d "$item" ]]; then
+      mkdir -p "${HOME}/.local/share"
+      while IFS= read -r -d '' share_item; do
+        share_name="$(basename "$share_item")"
+        [[ "$share_name" == "archmind-toolkit" ]] && continue
+        restore_home_item "$share_item" "${HOME}/.local/share/${share_name}" || return 1
+      done < <(find "$item" -mindepth 1 -maxdepth 1 -print0)
+      continue
+    fi
+
+    restore_home_item "$item" "${HOME}/.local/${name}" || return 1
+  done < <(find "$source" -mindepth 1 -maxdepth 1 -print0)
+}
+
+ensure_zsh_runtime_config() {
+  local zshrc="${HOME}/.zshrc"
+  local candidate backup changed=false
+  local legacy target
+  for legacy in .zsh_aliases .p10k.zsh; do
+    case "$legacy" in
+      .zsh_aliases) target="$ALIASES_FILE" ;;
+      .p10k.zsh) target="$P10K_FILE" ;;
+    esac
+    if [[ -f "$target" && ! -e "$HOME/$legacy" && ! -L "$HOME/$legacy" ]]; then
+      ln -s -- "$target" "$HOME/$legacy" || return 1
+    fi
+  done
+
+  [[ -e "$zshrc" ]] || { : > "$zshrc"; chmod 600 -- "$zshrc"; }
+  ensure_home_destination_writable "$zshrc" || return 1
+
+  candidate="$(mktemp "${TEMP_DIR}/zshrc.XXXXXX")"
+  cp -- "$zshrc" "$candidate"
+
+  sed -i \
+    -e '/^[[:space:]]*\[\[.*\.zsh_aliases.*source.*\.zsh_aliases.*$/d' \
+    -e '/^[[:space:]]*\[\[.*\.p10k\.zsh.*source.*\.p10k\.zsh.*$/d' \
+    "$candidate"
+
+  if ! grep -qxF 'export PATH="$HOME/.local/bin:$PATH"' "$candidate"; then
+    printf '\n%s\n' 'export PATH="$HOME/.local/bin:$PATH"' >> "$candidate"
+    changed=true
+  fi
+
+  if [[ -f "$ALIASES_FILE" ]] && \
+     ! grep -qF '$HOME/ArchMind/Config/Zsh/aliases.zsh' "$candidate"; then
+    printf '\n%s\n' '[[ -r "$HOME/ArchMind/Config/Zsh/aliases.zsh" ]] && source "$HOME/ArchMind/Config/Zsh/aliases.zsh"' >> "$candidate"
+    changed=true
+  fi
+
+  if [[ -f "$P10K_FILE" ]] && \
+     ! grep -qF '$HOME/ArchMind/Config/Zsh/p10k.zsh' "$candidate"; then
+    printf '\n%s\n' '[[ -r "$HOME/ArchMind/Config/Zsh/p10k.zsh" ]] && source "$HOME/ArchMind/Config/Zsh/p10k.zsh"' >> "$candidate"
+    changed=true
+  fi
+
+  if ! grep -qF '/usr/share/zsh/plugins/zsh-autosuggestions/zsh-autosuggestions.zsh' "$candidate"; then
+    printf '\n%s\n' '[[ -r /usr/share/zsh/plugins/zsh-autosuggestions/zsh-autosuggestions.zsh ]] && source /usr/share/zsh/plugins/zsh-autosuggestions/zsh-autosuggestions.zsh' >> "$candidate"
+    changed=true
+  fi
+
+  if ! grep -qF 'autoload -Uz compinit' "$candidate"; then
+    printf '\n%s\n%s\n' 'autoload -Uz compinit' 'compinit' >> "$candidate"
+    changed=true
+  fi
+
+  if ! grep -qF '/usr/share/zsh-theme-powerlevel10k/powerlevel10k.zsh-theme' "$candidate"; then
+    printf '\n%s\n' '[[ -r /usr/share/zsh-theme-powerlevel10k/powerlevel10k.zsh-theme ]] && source /usr/share/zsh-theme-powerlevel10k/powerlevel10k.zsh-theme' >> "$candidate"
+    changed=true
+  fi
+
+  # syntax-highlighting must be loaded after the other plugins.
+  if ! grep -qF '/usr/share/zsh/plugins/zsh-syntax-highlighting/zsh-syntax-highlighting.zsh' "$candidate"; then
+    printf '\n%s\n' '[[ -r /usr/share/zsh/plugins/zsh-syntax-highlighting/zsh-syntax-highlighting.zsh ]] && source /usr/share/zsh/plugins/zsh-syntax-highlighting/zsh-syntax-highlighting.zsh' >> "$candidate"
+    changed=true
+  fi
+
+  if [[ "$changed" == false ]]; then
+    rm -f -- "$candidate"
+    ok "Zsh, plugins, and aliases were already linked."
+    return 0
+  fi
+
+  if has zsh && ! zsh -n "$candidate"; then
+    rm -f -- "$candidate"
+    warn "The restored .zshrc contains a syntax error; automatic links were not applied."
+    return 0
+  fi
+
+  backup="${SAFETY_DIR}/zshrc-before-finalize-$(date +'%Y%m%d-%H%M%S')"
+  cp -a -- "$zshrc" "$backup"
+  cp -- "$candidate" "$zshrc"
+  chmod --reference="$backup" "$zshrc" 2>/dev/null || chmod 600 -- "$zshrc"
+  rm -f -- "$candidate"
+
+  ok "Zsh, plugins, PATH e aliases externos vinculados."
+  ok "Safety copy of .zshrc: $backup"
+}
+
+restore_configs() {
+  local source="$1"
+
+  [[ -d "${source}/configs" ]] || {
+    warn "This backup does not contain settings."
+    return 0
+  }
+
+  info "Restoring settings..."
+
+  if [[ -d "${source}/configs/.config" ]]; then
+    restore_config_tree "${source}/configs/.config" || return 1
+  fi
+
+  if [[ -d "${source}/configs/archmind-config" ]]; then
+    restore_home_item "${source}/configs/archmind-config" "$CONFIG_DIR" || return 1
+  fi
+
+  if [[ -d "${source}/configs/archmind-doctor-reports" ]]; then
+    if [[ -f "$PROJECT_DIR/tools/doctor-report.py" ]] && has python3; then
+      python3 -B "$PROJECT_DIR/tools/doctor-report.py" --import "${source}/configs/archmind-doctor-reports" || \
+        warn "Doctor report restore was incomplete; existing reports were preserved."
+    else
+      warn "Doctor reports were not restored: the report helper or Python is missing."
+    fi
+  fi
+
+  if [[ -d "${source}/configs/zsh-linked" ]]; then
+    info "Restoring modules and files linked by Zsh..."
+
+    local linked relative destination
+    while IFS= read -r -d '' linked; do
+      relative="${linked#${source}/configs/zsh-linked/}"
+      case "$relative" in
+        .zsh_aliases) destination="$ALIASES_FILE" ;;
+        .p10k.zsh) destination="$P10K_FILE" ;;
+        *) destination="${HOME}/${relative}" ;;
+      esac
+
+      restore_home_item "$linked" "$destination" || return 1
+    done < <(
+      find "${source}/configs/zsh-linked" -type f -print0
+    )
+  fi
+
+  local item base
+  while IFS= read -r -d '' item; do
+    base="$(basename "$item")"
+
+    case "$base" in
+      .config|archmind-config|archmind-doctor-reports|zsh-linked|zsh-files.txt)
+        continue
+        ;;
+      .zsh_aliases)
+        restore_home_item "$item" "$ALIASES_FILE" || return 1
+        continue
+        ;;
+      .p10k.zsh)
+        restore_home_item "$item" "$P10K_FILE" || return 1
+        continue
+        ;;
+      .local)
+        restore_local_tree "$item" || return 1
+        continue
+        ;;
+    esac
+
+    restore_home_item "$item" "${HOME}/${base}" || return 1
+  done < <(
+    find "${source}/configs" -mindepth 1 -maxdepth 1 -print0
+  )
+
+  ensure_zsh_runtime_config || return 1
+  ok "Settings restored."
+}
+
+restore_gnome() {
+  local source="$1"
+
+  [[ -d "${source}/gnome" ]] || {
+    warn "This backup does not contain GNOME data."
+    return 0
+  }
+
+  info "Restoring GNOME and extensions..."
+  mkdir -p "$USER_EXT_DIR"
+
+  [[ -d "${source}/gnome/extensions" ]] && \
+    cp -a "${source}/gnome/extensions/." "$USER_EXT_DIR/"
+
+  if has dconf; then
+    [[ -s "${source}/gnome/dconf/interface.dconf" ]] && \
+      dconf load /org/gnome/desktop/interface/ \
+        < "${source}/gnome/dconf/interface.dconf"
+
+    [[ -s "${source}/gnome/dconf/background.dconf" ]] && \
+      dconf load /org/gnome/desktop/background/ \
+        < "${source}/gnome/dconf/background.dconf"
+
+    [[ -s "${source}/gnome/dconf/window-manager.dconf" ]] && \
+      dconf load /org/gnome/desktop/wm/preferences/ \
+        < "${source}/gnome/dconf/window-manager.dconf"
+
+    [[ -s "${source}/gnome/dconf/extensions.dconf" ]] && \
+      dconf load /org/gnome/shell/extensions/ \
+        < "${source}/gnome/dconf/extensions.dconf"
+
+    [[ -s "${source}/gnome/dconf/gnome-shell.dconf" ]] && \
+      dconf load /org/gnome/shell/ \
+        < "${source}/gnome/dconf/gnome-shell.dconf"
+  fi
+
+  if has gnome-extensions && [[ -f "${source}/gnome/extensions-enabled.txt" ]]; then
+    local uuid
+
+    if [[ -f "${source}/gnome/extensions-all.txt" ]]; then
+      while IFS= read -r uuid; do
+        [[ -n "$uuid" ]] || continue
+        gnome-extensions disable "$uuid" 2>/dev/null || true
+      done < "${source}/gnome/extensions-all.txt"
+    fi
+
+    while IFS= read -r uuid; do
+      [[ -n "$uuid" ]] || continue
+      gnome-extensions enable "$uuid" 2>/dev/null \
+        || warn "Could not enable: $uuid"
+    done < "${source}/gnome/extensions-enabled.txt"
+  fi
+
+  ok "GNOME and extensions restored."
+}
+
+normalize_package_list() {
+  local source="$1"
+  local destination="$2"
+
+  if [[ -f "$source" ]]; then
+    tr -d '\r' < "$source" \
+      | sed '/^[[:space:]]*$/d' \
+      | LC_ALL=C sort -u > "$destination"
+  else
+    : > "$destination"
+  fi
+}
+
+append_unique_packages() {
+  local file="$1"
+  shift
+  printf '%s\n' "$@" >> "$file"
+  LC_ALL=C sort -u -o "$file" "$file"
+}
+
+package_missing_list() {
+  local requested="$1"
+  local installed="$2"
+  local output="$3"
+
+  # sort and comm must share the same locale. This prevents the error
+  # observed in pt_BR: "file 2 is not sorted".
+  LC_ALL=C sort -u -o "$requested" "$requested"
+  LC_ALL=C sort -u -o "$installed" "$installed"
+  LC_ALL=C comm -23 "$requested" "$installed" > "$output"
+}
+
+filter_official_packages() {
+  local requested="$1"
+  local available="$2"
+  local unavailable="$3"
+  local package
+
+  : > "$available"
+  : > "$unavailable"
+  while IFS= read -r package; do
+    [[ -n "$package" ]] || continue
+    if pacman -Si -- "$package" >/dev/null 2>&1; then
+      printf '%s\n' "$package" >> "$available"
+    else
+      printf '%s\n' "$package" >> "$unavailable"
+    fi
+  done < "$requested"
+}
+
+filter_aur_packages() {
+  local requested="$1"
+  local available="$2"
+  local unavailable="$3"
+  local package
+
+  : > "$available"
+  : > "$unavailable"
+  while IFS= read -r package; do
+    [[ -n "$package" ]] || continue
+    if yay -Si -- "$package" >/dev/null 2>&1; then
+      printf '%s\n' "$package" >> "$available"
+    else
+      printf '%s\n' "$package" >> "$unavailable"
+    fi
+  done < "$requested"
+}
+
+install_official_packages() {
+  local available="$1"
+  local failed="$2"
+  local package
+  local packages=()
+
+  : > "$failed"
+  [[ -s "$available" ]] || return 0
+  mapfile -t packages < "$available"
+
+  info "Installing ${#packages[@]} available official package(s)..."
+  if sudo pacman -S --needed --noconfirm -- "${packages[@]}"; then
+    return 0
+  fi
+
+  warn "The official package batch failed; trying packages separately."
+  for package in "${packages[@]}"; do
+    sudo pacman -S --needed --noconfirm -- "$package" || \
+      printf '%s\n' "$package" >> "$failed"
+  done
+}
+
+install_aur_packages() {
+  local available="$1"
+  local failed="$2"
+  local package
+
+  : > "$failed"
+  [[ -s "$available" ]] || return 0
+
+  info "Installing available AUR packages..."
+  while IFS= read -r package; do
+    [[ -n "$package" ]] || continue
+    yay -S --needed --noconfirm -- "$package" || \
+      printf '%s\n' "$package" >> "$failed"
+  done < "$available"
+}
+
+restore_packages() {
+  local source="$1"
+  local stamp report work
+  local official_requested aur_requested official_missing aur_missing
+  local official_available official_unavailable official_failed
+  local aur_available aur_unavailable aur_failed
+  local installed_all installed_foreign app
+
+  [[ -d "${source}/packages" ]] || {
+    warn "This backup does not contain packages."
+    return 0
+  }
+
+  stamp="$(date +'%Y%m%d-%H%M%S')"
+  report="${LOG_DIR}/package-restore-${stamp}"
+  work="$(make_temp_dir)"
+  mkdir -p "$report"
+
+  official_requested="${report}/official-requested.txt"
+  aur_requested="${report}/aur-requested.txt"
+  official_missing="${report}/official-missing-before.txt"
+  aur_missing="${report}/aur-missing-before.txt"
+  official_available="${report}/official-available.txt"
+  official_unavailable="${report}/official-unavailable.txt"
+  official_failed="${report}/official-failed.txt"
+  aur_available="${report}/aur-available.txt"
+  aur_unavailable="${report}/aur-unavailable.txt"
+  aur_failed="${report}/aur-failed.txt"
+  installed_all="${work}/installed-all.txt"
+  installed_foreign="${work}/installed-foreign.txt"
+
+  normalize_package_list "${source}/packages/pacman-native.txt" "$official_requested"
+  normalize_package_list "${source}/packages/pacman-aur.txt" "$aur_requested"
+
+  # Ensure the approved terminal setup even for old backups that recorded only
+  # .zshrc but not the packages providing its plugins.
+  append_unique_packages "$official_requested" \
+    zsh zsh-autosuggestions zsh-syntax-highlighting zsh-completions
+  append_unique_packages "$aur_requested" zsh-theme-powerlevel10k-git
+  if [[ -f "${source}/configs/.local/share/thumbnailers/exe-thumbnailer.thumbnailer" ]]; then
+    append_unique_packages "$official_requested" python-pillow icoutils
+    append_unique_packages "$aur_requested" icoextract
+  fi
+  if [[ -d "${source}/gnome" ]]; then
+    append_unique_packages "$official_requested" papirus-icon-theme
+    append_unique_packages "$aur_requested" gnome-rounded-blur papirus-folders
+  fi
+  if [[ -f "${source}/configs/.config/gamemode.ini" ]] && \
+     grep -Fq '; BEGIN ARCHMIND GAMEMODE BLUR' \
+       "${source}/configs/.config/gamemode.ini"; then
+    append_unique_packages "$official_requested" gamemode lib32-gamemode
+  fi
+  if [[ -f "${source}/configs/archmind-config/Patches/Plymouth/state.conf" ]]; then
+    append_unique_packages "$official_requested" plymouth
+  fi
+  [[ -s "${source}/packages/flatpak-apps.txt" ]] && \
+    append_unique_packages "$official_requested" flatpak
+
+  pacman -Qq | LC_ALL=C sort -u > "$installed_all"
+  pacman -Qqm | LC_ALL=C sort -u > "$installed_foreign"
+  package_missing_list "$official_requested" "$installed_all" "$official_missing"
+  package_missing_list "$aur_requested" "$installed_foreign" "$aur_missing"
+
+  printf '\nMissing official packages: %s\n' "$(count_nonempty_lines "$official_missing")"
+  printf 'Missing AUR packages:      %s\n' "$(count_nonempty_lines "$aur_missing")"
+  printf 'Report:                    %s\n\n' "$report"
+
+  if [[ -s "$official_missing" || -s "$aur_missing" ]]; then
+    info "Updating Arch Linux before recovery..."
+    sudo pacman -Syu --noconfirm || {
+      remove_temp_dir "$work"
+      error "The system update failed; settings will not be restored in this run."
+      return 1
+    }
+
+    filter_official_packages "$official_missing" "$official_available" "$official_unavailable"
+    install_official_packages "$official_available" "$official_failed"
+
+    if [[ -s "$aur_missing" ]]; then
+      if ! has yay; then
+        warn "yay is required to restore AUR packages."
+        if confirm "Install yay now?"; then
+          install_yay || warn "Failed to install yay; AUR packages will remain recorded as pending."
+        fi
+      fi
+
+      if has yay; then
+        filter_aur_packages "$aur_missing" "$aur_available" "$aur_unavailable"
+        install_aur_packages "$aur_available" "$aur_failed"
+      else
+        cp -- "$aur_missing" "$aur_unavailable"
+        : > "$aur_failed"
+      fi
+    else
+      : > "$aur_available"
+      : > "$aur_unavailable"
+      : > "$aur_failed"
+    fi
+  else
+    : > "$official_available"
+    : > "$official_unavailable"
+    : > "$official_failed"
+    : > "$aur_available"
+    : > "$aur_unavailable"
+    : > "$aur_failed"
+  fi
+
+  if [[ -s "${source}/packages/flatpak-apps.txt" ]]; then
+    if has flatpak; then
+      while IFS= read -r app; do
+        [[ -n "$app" ]] || continue
+        flatpak install -y flathub "$app" || \
+          printf '%s\n' "$app" >> "${report}/flatpak-failed.txt"
+      done < "${source}/packages/flatpak-apps.txt"
+    else
+      cp -- "${source}/packages/flatpak-apps.txt" "${report}/flatpak-failed.txt"
+    fi
+  fi
+
+  pacman -Qq | LC_ALL=C sort -u > "$installed_all"
+  pacman -Qqm | LC_ALL=C sort -u > "$installed_foreign"
+  package_missing_list "$official_requested" "$installed_all" "${report}/official-still-missing.txt"
+  package_missing_list "$aur_requested" "$installed_foreign" "${report}/aur-still-missing.txt"
+
+  ok "Package restoration complete."
+  printf 'Official packages still missing: %s\n' "$(count_nonempty_lines "${report}/official-still-missing.txt")"
+  printf 'AUR packages still missing:      %s\n' "$(count_nonempty_lines "${report}/aur-still-missing.txt")"
+  printf 'Full report:             %s\n' "$report"
+
+  if [[ -s "${report}/official-still-missing.txt" || \
+        -s "${report}/aur-still-missing.txt" ]]; then
+    warn "Some packages remain pending; their names are listed in the report above."
+  fi
+
+  remove_temp_dir "$work"
+}
+
+version_is_older() {
+  local candidate="$1"
+  local current="$2"
+  local first
+
+  [[ -n "$candidate" && "$candidate" != "$current" ]] || return 1
+  first="$(printf '%s\n%s\n' "$candidate" "$current" | sort -V | head -n1)"
+  [[ "$first" == "$candidate" ]]
+}
+
+restore_project() {
+  local source="$1"
+
+  [[ -d "${source}/project" ]] || {
+    warn "This backup does not contain the ArchMind project."
+    return 0
+  }
+
+  local stamp backup_version recovered setting
+  local safety
+  stamp="$(date +'%Y%m%d-%H%M%S')"
+  safety="${SAFETY_DIR}/project-before-restore-${stamp}"
+  backup_version="$(manifest_value "${source}/manifest.txt" version)"
+  mkdir -p "$safety"
+
+  if [[ -n "$(find "$PROJECT_DIR" -mindepth 1 -print -quit 2>/dev/null)" ]]; then
+    cp -a "${PROJECT_DIR}/." "$safety/"
+    ok "Project safety copy: $safety"
+  fi
+
+  if version_is_older "$backup_version" "$VERSION"; then
+    recovered="${ROOT_DIR}/Recovered-Projects/ArchMind-${backup_version:-unknown}-${stamp}"
+    mkdir -p "$recovered"
+    cp -a "${source}/project/." "$recovered/" || return 1
+
+    # Personal preferences can be restored without replacing stable code.
+    for setting in config/settings.zsh config/archmind.conf; do
+      if [[ -f "${source}/project/${setting}" ]]; then
+        if [[ "$setting" == "config/settings.zsh" ]]; then
+          restore_home_item "${source}/project/${setting}" "${CONFIG_DIR}/settings.zsh" || return 1
+        else
+          restore_home_item "${source}/project/${setting}" "${PROJECT_DIR}/${setting}" || return 1
+        fi
+      fi
+    done
+
+    warn "The backup contains ArchMind ${backup_version}; stable installation ${VERSION} was preserved."
+    ok "The previous project was saved separately at: $recovered"
+    return 0
+  fi
+
+  find "$PROJECT_DIR" -mindepth 1 -maxdepth 1 -exec rm -rf -- {} + || return 1
+  cp -a "${source}/project/." "$PROJECT_DIR/" || return 1
+
+  ok "ArchMind project restored to: $PROJECT_DIR"
+}
+
+manifest_value() {
+  local manifest="$1"
+  local key="$2"
+  awk -F= -v key="$key" '$1 == key {sub(/^[^=]*=/, ""); print; exit}' "$manifest" 2>/dev/null
+}
+
+count_nonempty_lines() {
+  local file="$1"
+  [[ -f "$file" ]] || { echo 0; return; }
+  grep -cve '^$' "$file" 2>/dev/null || true
+}
+
+show_backup_summary() {
+  local source="$1"
+  local manifest="${source}/manifest.txt"
+  local created host version mode
+  local native_count aur_count flatpak_count extension_count
+
+  created="$(manifest_value "$manifest" created)"
+  host="$(manifest_value "$manifest" hostname)"
+  version="$(manifest_value "$manifest" version)"
+  mode="$(manifest_value "$manifest" mode)"
+
+  native_count="$(manifest_value "$manifest" pacman_packages)"
+  aur_count="$(manifest_value "$manifest" aur_packages)"
+  flatpak_count="$(manifest_value "$manifest" flatpak_apps)"
+  extension_count="$(manifest_value "$manifest" gnome_extensions)"
+
+  [[ -n "$native_count" ]] || native_count="$(count_nonempty_lines "${source}/packages/pacman-native.txt")"
+  [[ -n "$aur_count" ]] || aur_count="$(count_nonempty_lines "${source}/packages/pacman-aur.txt")"
+  [[ -n "$flatpak_count" ]] || flatpak_count="$(count_nonempty_lines "${source}/packages/flatpak-apps.txt")"
+  [[ -n "$extension_count" ]] || extension_count="$(count_nonempty_lines "${source}/gnome/extensions-all.txt")"
+
+  echo
+  echo "BACKUP SUMMARY"
+  echo
+  printf '  Date:                 %s\n' "${created:-unknown}"
+  printf '  Computer:             %s\n' "${host:-unknown}"
+  printf '  ArchMind version:     %s\n' "${version:-unknown}"
+  printf '  Type:                 %s\n' "${mode:-unknown}"
+  echo
+  printf '  Settings:             %s\n' "$([[ -d "${source}/configs" ]] && echo 'Yes' || echo 'No')"
+  printf '  GNOME and extensions: %s (%s extension(s))\n' "$([[ -d "${source}/gnome" ]] && echo 'Yes' || echo 'No')" "$extension_count"
+  printf '  Official packages:    %s\n' "$native_count"
+  printf '  AUR packages:         %s\n' "$aur_count"
+  printf '  Flatpak applications: %s\n' "$flatpak_count"
+  printf '  ArchMind project:     %s\n' "$([[ -d "${source}/project" ]] && echo 'Yes' || echo 'No')"
+  echo
+}
+
+restore_selected_components() {
+  local source="$1"
+  local do_packages="$2"
+  local do_configs="$3"
+  local do_gnome="$4"
+  local do_project="$5"
+
+  # On a new installation, programs must exist before their settings.
+  if [[ "$do_packages" == true ]]; then
+    restore_packages "$source" || return 1
+  fi
+  if [[ "$do_configs" == true ]]; then
+    restore_configs "$source" || return 1
+  fi
+  if [[ "$do_gnome" == true ]]; then
+    restore_gnome "$source" || return 1
+  fi
+  if [[ "$do_project" == true ]]; then
+    restore_project "$source" || return 1
+  fi
+
+  if [[ "$do_packages" == true || "$do_configs" == true ]]; then
+    ensure_zsh_runtime_config || return 1
+  fi
+
+  if [[ "$do_configs" == true || "$do_gnome" == true ]]; then
+    configure_nautilus_integration
+    configure_gnome_appearance_integration
+  fi
+  if [[ "$do_packages" == true || "$do_configs" == true || "$do_gnome" == true ]]; then
+    configure_gamemode_blur_integration
+  fi
+  if [[ "$do_configs" == true ]] && \
+     [[ -f "$CONFIG_DIR/NVIDIA/vibrance.conf" || \
+        -f "$HOME/.config/systemd/user/nvibrant.service" ]]; then
+    configure_nvibrant_integration
+  fi
+}
+
+choose_restore_components() {
+  local source="$1"
+  local do_packages=false do_configs=false do_gnome=false do_project=false
+
+  echo
+  echo "Select the available components:"
+  echo
+
+  if [[ -d "${source}/configs" ]] && confirm "Restore user settings and Zsh?"; then
+    do_configs=true
+  fi
+
+  if [[ -d "${source}/gnome" ]] && confirm "Restore GNOME and extensions?"; then
+    do_gnome=true
+  fi
+
+  if [[ -d "${source}/project" ]] && confirm "Restore the ArchMind project?"; then
+    do_project=true
+  fi
+
+  if [[ -d "${source}/packages" ]]; then
+    warn "Package installation may take time and download a large amount of data."
+    if confirm "Reinstall packages recorded in the backup?"; then
+      do_packages=true
+    fi
+  fi
+
+  if [[ "$do_packages" == false && "$do_configs" == false && "$do_gnome" == false && "$do_project" == false ]]; then
+    warn "No component selected."
+    return 0
+  fi
+
+  echo
+  echo "Componentes selecionados:"
+  [[ "$do_packages" == true ]] && echo "  - Packages (executed first)"
+  [[ "$do_configs" == true ]] && echo "  - Settings and Zsh"
+  [[ "$do_gnome" == true ]] && echo "  - GNOME and extensions"
+  [[ "$do_project" == true ]] && echo "  - ArchMind project"
+  echo
+
+  confirm "Confirm the selected restoration?" || { warn "Restoration cancelled."; return 0; }
+  backup_safety || return 1
+  restore_selected_components "$source" "$do_packages" "$do_configs" "$do_gnome" "$do_project" || return 1
+}
+
+restore_backup() {
+  local mode="$1"
+  local pattern backup extracted option
+
+  case "$mode" in
+    completo) pattern='ArchMind-completo-*.archmind' ;;
+    configuracoes) pattern='ArchMind-configuracoes-*.archmind' ;;
+    gnome) pattern='ArchMind-gnome-*.archmind' ;;
+    pacotes) pattern='ArchMind-pacotes-*.archmind' ;;
+    projeto) pattern='ArchMind-projeto-*.archmind' ;;
+    qualquer) pattern='ArchMind-*.archmind' ;;
+    *) die "Invalid mode." ;;
+  esac
+
+  backup="$(latest_backup "$pattern")"
+
+  [[ -n "$backup" ]] || {
+    error "No backup found for: $mode"
+    return 1
+  }
+
+  info "Backup found:"
+  echo "  $backup"
+
+  extracted="$(extract_archmind "$backup")"
+  if ! (verify_extracted "$extracted"); then
+    remove_temp_dir "$extracted" || true
+    return 1
+  fi
+  show_backup_summary "$extracted"
+
+  case "$mode" in
+    configuracoes)
+      confirm "Restore settings from this backup?" || { remove_temp_dir "$extracted"; return 0; }
+      backup_safety
+      restore_configs "$extracted"
+      ;;
+    gnome)
+      confirm "Restore GNOME and extensions from this backup?" || { remove_temp_dir "$extracted"; return 0; }
+      backup_safety
+      restore_gnome "$extracted"
+      ;;
+    pacotes)
+      warn "This operation will reinstall the recorded packages."
+      confirm "Proceed with package installation?" || { remove_temp_dir "$extracted"; return 0; }
+      restore_packages "$extracted"
+      ;;
+    projeto)
+      confirm "Restore the ArchMind project from this backup?" || { remove_temp_dir "$extracted"; return 0; }
+      backup_safety
+      restore_project "$extracted"
+      ;;
+    completo|qualquer)
+      echo "Choose the restoration mode:"
+      echo
+      echo "1) Restore settings, GNOME, and project (without installing packages)"
+      echo "2) Restore everything, including package installation"
+      echo "3) Escolher componentes manualmente"
+      echo "0) Cancel"
+      echo
+      read -rp "Choice: " option
+
+      case "$option" in
+        1)
+          confirm "Confirm restoration without installing packages?" || { remove_temp_dir "$extracted"; return 0; }
+          backup_safety
+          restore_selected_components "$extracted" false true true true
+          ;;
+        2)
+          warn "Packages will be installed before settings are restored."
+          confirm "Confirm full restoration with packages?" || { remove_temp_dir "$extracted"; return 0; }
+          backup_safety
+          restore_selected_components "$extracted" true true true true
+          ;;
+        3)
+          choose_restore_components "$extracted" || true
+          ;;
+        0)
+          warn "Cancelled."
+          ;;
+        *)
+          warn "Invalid option."
+          ;;
+      esac
+      ;;
+  esac
+
+  remove_temp_dir "$extracted"
+  warn "Log out and back in after restoring GNOME or Zsh."
+}
+
+
+show_restore_plan() {
+  local source="$1"
+  local do_packages="$2"
+  local do_configs="$3"
+  local do_gnome="$4"
+  local do_project="$5"
+  local simulation="${6:-false}"
+
+  echo
+  if [[ "$simulation" == true ]]; then
+    echo "SIMULATION — NO CHANGES WILL BE MADE"
+  else
+    echo "RESTORATION PLAN"
+  fi
+  echo
+
+  [[ "$do_packages" == true ]] && {
+    echo "  1. Install packages recorded in the backup"
+    printf '     Official: %s | AUR: %s | Flatpak: %s\n' \
+      "$(count_nonempty_lines "${source}/packages/pacman-native.txt")" \
+      "$(count_nonempty_lines "${source}/packages/pacman-aur.txt")" \
+      "$(count_nonempty_lines "${source}/packages/flatpak-apps.txt")"
+  }
+
+  [[ "$do_configs" == true ]] && {
+    echo "  2. Restore user settings and Zsh"
+    echo "     Main destinations: ~/.config and hidden files in Home"
+  }
+
+  [[ "$do_gnome" == true ]] && {
+    echo "  3. Restore GNOME, dconf, and extensions"
+    echo "     May require logging out and back in"
+  }
+
+  [[ "$do_project" == true ]] && {
+    echo "  4. Restore the ArchMind project"
+    echo "     Destination: $PROJECT_DIR"
+  }
+
+  echo
+  if [[ "$do_packages" == false && "$do_configs" == false && "$do_gnome" == false && "$do_project" == false ]]; then
+    warn "No component selected for the plan."
+    return 1
+  fi
+
+  [[ "$simulation" == true ]] && {
+    echo "  The safety copy would be created in: $SAFETY_DIR"
+    echo "  No file was copied, removed, or installed."
+    echo
+  }
+
+  # The final test above returns 1 for real plans (simulation=false).
+  # Successfully displaying the plan must always return success so
+  # run_restore_plan can proceed to user confirmation.
+  return 0
+}
+
+run_restore_plan() {
+  local source="$1"
+  local do_packages="$2"
+  local do_configs="$3"
+  local do_gnome="$4"
+  local do_project="$5"
+
+  show_restore_plan "$source" "$do_packages" "$do_configs" "$do_gnome" "$do_project" false || return 1
+  confirm "Execute this restoration plan?" || { warn "Restoration cancelled."; return 0; }
+
+  backup_safety
+  restore_selected_components "$source" "$do_packages" "$do_configs" "$do_gnome" "$do_project"
+}
+
+restore_by_situation() {
+  local situation="$1"
+  local backup extracted status=0
+  local do_packages=false do_configs=false do_gnome=false do_project=false
+
+  backup="$(latest_backup 'ArchMind-*.archmind')"
+  [[ -n "$backup" ]] || {
+    error "No ArchMind backup found."
+    return 1
+  }
+
+  info "Most recent backup:"
+  echo "  $backup"
+
+  extracted="$(extract_archmind "$backup")"
+  if ! (verify_extracted "$extracted"); then
+    remove_temp_dir "$extracted" || true
+    return 1
+  fi
+  show_backup_summary "$extracted"
+
+  case "$situation" in
+    formatacao)
+      do_packages=true
+      [[ -d "${extracted}/configs" ]] && do_configs=true
+      [[ -d "${extracted}/gnome" ]] && do_gnome=true
+      [[ -d "${extracted}/project" ]] && do_project=true
+      warn "New Arch Linux mode: packages will be installed first."
+      run_restore_plan "$extracted" "$do_packages" "$do_configs" "$do_gnome" "$do_project" || status=$?
+      ;;
+    sistema_atual)
+      [[ -d "${extracted}/configs" ]] && do_configs=true
+      [[ -d "${extracted}/gnome" ]] && confirm "Also restore GNOME and extensions?" && do_gnome=true
+      [[ -d "${extracted}/project" ]] && confirm "Also restore the ArchMind project?" && do_project=true
+      warn "Packages will not be installed in this mode."
+      run_restore_plan "$extracted" false "$do_configs" "$do_gnome" "$do_project" || status=$?
+      ;;
+    componente)
+      choose_restore_components "$extracted" || status=$?
+      ;;
+    migracao)
+      warn "Migration may load settings specific to the previous computer."
+      [[ -d "${extracted}/configs" ]] && do_configs=true
+      [[ -d "${extracted}/project" ]] && do_project=true
+      [[ -d "${extracted}/gnome" ]] && confirm "Also restore GNOME and extensions?" && do_gnome=true
+      [[ -d "${extracted}/packages" ]] && confirm "Install recorded packages on the new machine?" && do_packages=true
+      show_restore_plan "$extracted" "$do_packages" "$do_configs" "$do_gnome" "$do_project" false || true
+      warn "Review drivers, monitors, audio, and machine-specific paths before confirming."
+      if confirm "Proceed with the selected migration?"; then
+        backup_safety || status=$?
+        if (( status == 0 )); then
+          restore_selected_components "$extracted" "$do_packages" "$do_configs" "$do_gnome" "$do_project" || status=$?
+        fi
+      fi
+      ;;
+    simulacao)
+      echo "Choose the scenario to simulate:"
+      echo "1) Newly formatted system"
+      echo "2) Current system, without packages"
+      echo "3) Migration to another computer"
+      echo "0) Cancel"
+      local option
+      read -rp "Choice: " option
+      case "$option" in
+        1) show_restore_plan "$extracted" true true true true true ;;
+        2) show_restore_plan "$extracted" false true true true true ;;
+        3) show_restore_plan "$extracted" true true true true true
+           warn "Hardware-dependent settings must be reviewed during migration." ;;
+        0) warn "Simulation cancelled." ;;
+        *) warn "Invalid option." ;;
+      esac
+      ;;
+    *) warn "Invalid situation." ;;
+  esac
+
+  remove_temp_dir "$extracted"
+  if (( status != 0 )); then
+    error "Restoration was not completed. Review the messages above before trying again."
+  fi
+  return "$status"
+}
+
+list_safety_copies() {
+  ensure_dirs
+  local found=0 item
+  echo "SAFETY COPIES"
+  echo
+  while IFS= read -r item; do
+    [[ -n "$item" ]] || continue
+    found=1
+    printf '  %s\n' "$item"
+  done < <(find "$SAFETY_DIR" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' 2>/dev/null | sort -r)
+  [[ "$found" -eq 1 ]] || warn "No safety copy found."
+  echo
+  warn "Automatic recovery of these copies does not remove current files; use them as a safe source for manual recovery."
+}
+
+enable_multilib() {
+  require_arch
+
+  if pacman -Sl multilib >/dev/null 2>&1; then
+    ok "multilib is already enabled."
+    return 0
+  fi
+
+  info "Habilitando multilib..."
+
+  sudo cp -a /etc/pacman.conf \
+    "/etc/pacman.conf.archmind-$(date +'%Y%m%d-%H%M%S').bak"
+
+  sudo sed -i \
+    '/^#\[multilib\]/,/^#Include = \/etc\/pacman.d\/mirrorlist/ {
+      s/^#\[multilib\]/[multilib]/
+      s/^#Include = \/etc\/pacman.d\/mirrorlist/Include = \/etc\/pacman.d\/mirrorlist/
+    }' /etc/pacman.conf
+
+  # Avoid a partial update after enabling multilib.
+  sudo pacman -Syu --noconfirm
+}
+
+install_yay() {
+  require_arch
+
+  if has yay; then
+    ok "yay is already installed."
+    return 0
+  fi
+
+  sudo pacman -S --needed --noconfirm base-devel git
+
+  local dir
+  dir="$(mktemp -d)"
+
+  git clone https://aur.archlinux.org/yay.git "${dir}/yay"
+
+  (
+    cd "${dir}/yay"
+    makepkg -si --needed --noconfirm
+  )
+
+  rm -rf "$dir"
+  if ! has yay; then
+    error "Failed to install yay."
+    return 1
+  fi
+}
+
+install_available() {
+  local title="$1"
+  shift
+
+  local available=()
+  local missing=()
+  local pkg
+
+  for pkg in "$@"; do
+    if pacman -Si "$pkg" >/dev/null 2>&1; then
+      available+=("$pkg")
+    else
+      missing+=("$pkg")
+    fi
+  done
+
+  if [[ "${#available[@]}" -gt 0 ]]; then
+  info "Installing: $title"
+    sudo pacman -S --needed --noconfirm "${available[@]}"
+  fi
+
+  if [[ "${#missing[@]}" -gt 0 ]]; then
+    warn "Packages not found:"
+    printf '  - %s\n' "${missing[@]}"
+  fi
+}
+
+configure_file_templates() {
+  local templates_dir=""
+  local template
+
+  if has xdg-user-dirs-update; then
+    xdg-user-dirs-update >/dev/null 2>&1 || true
+  fi
+
+  if has xdg-user-dir; then
+    templates_dir="$(xdg-user-dir TEMPLATES 2>/dev/null || true)"
+  fi
+
+  # When TEMPLATES is not configured, xdg-user-dir may return Home.
+  # Never create loose templates directly in this directory.
+  if [[ -z "$templates_dir" || "$templates_dir" == "$HOME" || \
+        "$templates_dir" == "$HOME/" ]]; then
+    templates_dir="$HOME/Templates"
+    if has xdg-user-dirs-update; then
+      xdg-user-dirs-update --set TEMPLATES "$templates_dir" \
+        >/dev/null 2>&1 || true
+    fi
+  fi
+
+  mkdir -p -- "$templates_dir"
+
+  for template in \
+    "Documento vazio.txt" \
+    "Script Python.py" \
+    "Script Shell.sh" \
+    "Documento Markdown.md"; do
+    [[ -e "$templates_dir/$template" || -L "$templates_dir/$template" ]] || \
+      : > "$templates_dir/$template"
+  done
+
+  ok "New Document menu templates configured at: $templates_dir"
+}
+
+install_base() {
+  require_arch
+
+  install_available "Base Profile" \
+    firefox \
+    nemo \
+    nemo-fileroller \
+    file-roller \
+    noto-fonts \
+    noto-fonts-extra \
+    noto-fonts-cjk \
+    noto-fonts-emoji \
+    ttf-dejavu \
+    ttf-liberation \
+    gstreamer \
+    gst-plugins-base \
+    gst-plugins-good \
+    gst-plugins-bad \
+    gst-plugins-ugly \
+    gst-libav \
+    gst-plugin-pipewire \
+    ffmpeg \
+    ffmpegthumbnailer \
+    pipewire \
+    pipewire-pulse \
+    pipewire-alsa \
+    wireplumber \
+    pavucontrol \
+    flatpak \
+    pacman-contrib \
+    rsync \
+    unzip \
+    zip \
+    7zip \
+    unrar \
+    wget \
+    curl \
+    git \
+    gvfs \
+    gvfs-mtp \
+    gvfs-gphoto2 \
+    ntfs-3g \
+    xdg-user-dirs \
+    xdg-utils \
+    python-pillow \
+    icoutils \
+    papirus-icon-theme \
+    lm_sensors \
+    btop \
+    plymouth
+
+  install_yay
+
+  if ! pacman -Qq pamac-aur >/dev/null 2>&1; then
+    yay -S --needed --noconfirm pamac-aur
+  fi
+
+  if ! pacman -Qq icoextract >/dev/null 2>&1; then
+    yay -S --needed --noconfirm icoextract || \
+      warn "icoextract remains pending; the rest of Base Profile will continue."
+  fi
+
+  if ! pacman -Qq gnome-rounded-blur >/dev/null 2>&1; then
+    yay -S --needed --noconfirm gnome-rounded-blur || \
+      warn "gnome-rounded-blur remains pending; the rest of Base Profile will continue."
+  fi
+
+  if ! pacman -Qq papirus-folders >/dev/null 2>&1; then
+    yay -S --needed --noconfirm papirus-folders || \
+      warn "papirus-folders remains pending; the rest of Base Profile will continue."
+  fi
+
+  configure_file_templates
+  configure_nautilus_integration
+  configure_gnome_appearance_integration
+
+  ok "Base Profile installed."
+}
+
+install_terminal() {
+  require_arch
+
+  install_available "Terminal Profile" \
+    zsh \
+    gnome-terminal \
+    fastfetch \
+    eza \
+    bat \
+    fzf \
+    zoxide \
+    ripgrep \
+    fd \
+    git \
+    tree \
+    jq \
+    less \
+    man-db \
+    man-pages \
+    ttf-jetbrains-mono-nerd \
+    ttf-nerd-fonts-symbols \
+    ttf-nerd-fonts-symbols-mono \
+    zsh-autosuggestions \
+    zsh-syntax-highlighting \
+    zsh-completions
+
+  install_yay
+
+  if ! pacman -Qq zsh-theme-powerlevel10k-git >/dev/null 2>&1; then
+    yay -S --needed --noconfirm zsh-theme-powerlevel10k-git
+  fi
+
+  if [[ ! -f "${HOME}/.zshrc" ]]; then
+    cat > "${HOME}/.zshrc" <<'EOF'
+export PATH="$HOME/.local/bin:$PATH"
+
+[[ -f /usr/share/zsh-theme-powerlevel10k/powerlevel10k.zsh-theme ]] && \
+  source /usr/share/zsh-theme-powerlevel10k/powerlevel10k.zsh-theme
+
+[[ -f /usr/share/zsh/plugins/zsh-autosuggestions/zsh-autosuggestions.zsh ]] && \
+  source /usr/share/zsh/plugins/zsh-autosuggestions/zsh-autosuggestions.zsh
+
+autoload -Uz compinit
+compinit
+
+command -v zoxide >/dev/null 2>&1 && eval "$(zoxide init zsh)"
+[[ -f "$HOME/ArchMind/Config/Zsh/p10k.zsh" ]] && source "$HOME/ArchMind/Config/Zsh/p10k.zsh"
+[[ -r "$HOME/ArchMind/Config/Zsh/aliases.zsh" ]] && source "$HOME/ArchMind/Config/Zsh/aliases.zsh"
+
+[[ -f /usr/share/zsh/plugins/zsh-syntax-highlighting/zsh-syntax-highlighting.zsh ]] && \
+  source /usr/share/zsh/plugins/zsh-syntax-highlighting/zsh-syntax-highlighting.zsh
+EOF
+  fi
+
+  ensure_zsh_runtime_config || return 1
+
+  fc-cache -f >/dev/null 2>&1 || true
+
+  if confirm "Make Zsh your default shell?"; then
+    chsh -s "$(command -v zsh)"
+  fi
+
+  ok "Terminal Profile installed with Zsh, plugins, and Powerlevel10k."
+}
+
+install_gaming() {
+  require_arch
+  enable_multilib
+
+  install_available "Gaming Profile" \
+    steam \
+    wine \
+    wine-mono \
+    wine-gecko \
+    winetricks \
+    cabextract \
+    unzip \
+    7zip \
+    protontricks \
+    gamescope \
+    lutris \
+    gamemode \
+    lib32-gamemode \
+    mangohud \
+    lib32-mangohud \
+    vulkan-tools \
+    vulkan-icd-loader \
+    lib32-vulkan-icd-loader \
+    lib32-alsa-plugins \
+    lib32-libpulse \
+    lib32-openal \
+    lib32-pipewire \
+    discord
+
+  install_yay
+  yay -S --needed --noconfirm protonup-qt-bin heroic-games-launcher-bin || true
+
+  configure_gamemode_blur_integration
+  configure_nvibrant_integration
+
+  ok "Gaming Profile installed."
+}
+
+install_audio() {
+  require_arch
+
+  install_available "Audio Profile" \
+    easyeffects \
+    lsp-plugins-lv2 \
+    calf \
+    mda.lv2 \
+    x42-plugins-lv2 \
+    zam-plugins-lv2 \
+    rubberband \
+    rnnoise \
+    helvum \
+    qpwgraph \
+    pavucontrol \
+    pipewire-jack \
+    audacity
+
+  ok "Audio Profile installed."
+}
+
+install_development() {
+  require_arch
+
+  install_available "Development Profile" \
+    git \
+    python \
+    python-pip \
+    python-pipx \
+    python-virtualenv \
+    tk \
+    nodejs \
+    npm \
+    docker \
+    docker-compose \
+    base-devel \
+    cmake \
+    meson \
+    ninja \
+    shellcheck \
+    shfmt
+
+  install_yay
+  yay -S --needed --noconfirm visual-studio-code-bin || true
+
+  ok "Development Profile installed."
+}
+
+install_all_profiles() {
+  install_base
+  install_terminal
+  install_gaming
+  install_audio
+  install_development
+}
+
+list_backups() {
+  local found=0
+
+  while IFS= read -r file; do
+    [[ -n "$file" ]] || continue
+    found=1
+    echo "$file"
+  done < <(
+    find "$BACKUP_DIR" -maxdepth 1 -type f -name '*.archmind' | sort
+  )
+
+  [[ "$found" -eq 1 ]] || warn "No backup found."
+}
+
+backup_menu() {
+  while true; do
+    header
+
+    cat <<'EOF'
+BACKUP
+
+1) Full backup
+2) Settings backup
+3) GNOME and extensions backup
+4) Package backup
+5) Back up the ArchMind project
+6) List backups
+
+0) Back
+EOF
+
+    echo
+    read -rp "Choice: " choice
+
+    case "$choice" in
+      1) create_backup completo; pause ;;
+      2) create_backup configuracoes; pause ;;
+      3) create_backup gnome; pause ;;
+      4) create_backup pacotes; pause ;;
+      5) create_backup projeto; pause ;;
+      6) list_backups; pause ;;
+      0) return 0 ;;
+      *) warn "Invalid option."; pause ;;
+    esac
+  done
+}
+
+advanced_restore_menu() {
+  while true; do
+    header
+    cat <<'EOF'
+RESTORATION — ADVANCED OPTIONS
+
+1) Full backup by type
+2) Settings only
+3) GNOME and extensions only
+4) Packages only
+5) ArchMind project only
+6) Latest backup with manual selection
+
+0) Back
+EOF
+    echo
+    read -rp "Choice: " choice
+    case "$choice" in
+      1) restore_backup completo; pause ;;
+      2) restore_backup configuracoes; pause ;;
+      3) restore_backup gnome; pause ;;
+      4) restore_backup pacotes; pause ;;
+      5) restore_backup projeto; pause ;;
+      6) restore_backup qualquer; pause ;;
+      0) return 0 ;;
+      *) warn "Invalid option."; pause ;;
+    esac
+  done
+}
+
+restore_menu() {
+  while true; do
+    header
+
+    cat <<'EOF'
+RESTORATION BY SITUATION
+
+1) Recover system after formatting
+   Install packages first, then restore the environment
+
+2) Restore settings on the current system
+   Do not reinstall programs automatically
+
+3) Recover specific components
+   Choose settings, GNOME, packages, or project
+
+4) Migrate to another computer
+   Display warnings for hardware-dependent settings
+
+5) Verify and simulate restoration
+   Show the impact without modifying the system
+
+6) List safety copies
+7) Advanced options
+
+0) Back
+EOF
+
+    echo
+    read -rp "Choice: " choice
+
+    case "$choice" in
+      1) restore_by_situation formatacao; pause ;;
+      2) restore_by_situation sistema_atual; pause ;;
+      3) restore_by_situation componente; pause ;;
+      4) restore_by_situation migracao; pause ;;
+      5) restore_by_situation simulacao; pause ;;
+      6) list_safety_copies; pause ;;
+      7) advanced_restore_menu ;;
+      0) return 0 ;;
+      *) warn "Invalid option."; pause ;;
+    esac
+  done
+}
+
+install_menu() {
+  while true; do
+    header
+
+    cat <<'EOF'
+INSTALLATION
+
+1) Base Profile
+   Firefox, Yay, Pamac, fonts, codecs, PipeWire, and utilities
+
+2) Terminal Profile
+   Zsh, plugins, Powerlevel10k, Kitty, and terminal tools
+
+3) Gaming Profile
+   Steam, Wine, Winetricks, Lutris, MangoHud, and GameMode
+
+4) Audio Profile
+   EasyEffects, LV2 plugins, Helvum, and QpwGraph
+
+5) Development Profile
+   Python, Node.js, Docker, compilers, and VS Code
+
+6) Install all profiles
+
+7) Configure Nautilus integration
+   Folders first, real .exe icons, and transparent thumbnails
+
+8) Configure GNOME appearance
+   Rounded blur for Blur My Shell and yellow Papirus-Dark folders
+
+9) Configure GameMode + Blur My Shell
+   Disable blur during games and restore its state when they close
+
+10) Configure NVIDIA Digital Vibrance
+    Intensity, automatic service, status, and removal
+
+11) Plymouth / Boot Visual
+    Independent, auditable, reversible patch for spinner and GRUB
+
+12) Wine Compatibility Pack
+    Runtimes, fonts, and legacy DirectX in a selected Wine prefix
+
+13) GNOME Drag Hover
+    Raise applications and windows while dragging files on Wayland
+
+14) Caps Lock No Delay
+    Remove the Caps Lock release delay using keyd
+
+15) Firefox / ChatGPT Color Emoji Fix
+    Prioritize color emoji without changing normal text spacing
+
+0) Back
+EOF
+
+    echo
+    read -rp "Choice: " choice
+
+    case "$choice" in
+      1) install_base; pause ;;
+      2) install_terminal; pause ;;
+      3) install_gaming; pause ;;
+      4) install_audio; pause ;;
+      5) install_development; pause ;;
+      6) install_all_profiles; pause ;;
+      7) configure_nautilus_integration; pause ;;
+      8) configure_gnome_appearance_integration; pause ;;
+      9) open_gamemode_blur_integration; pause ;;
+      10) open_nvibrant_integration; pause ;;
+      11) open_plymouth_patch; pause ;;
+      12) open_wine_compatibility_pack; pause ;;
+      13) open_gnome_drag_hover; pause ;;
+      14) open_capslock_nodelay; pause ;;
+      15) open_firefox_chatgpt_emoji; pause ;;
+      0) return 0 ;;
+      *) warn "Invalid option."; pause ;;
+    esac
+  done
+}
+
+project_menu() {
+  while true; do
+    header
+
+    cat <<'EOF'
+ARCHMIND PROJECT
+
+1) Back up project
+2) Restore project
+3) Import Zsh modules into the project
+4) Show detected Zsh files
+5) Show project location in the terminal
+
+0) Back
+EOF
+
+    echo
+    read -rp "Choice: " choice
+
+    case "$choice" in
+      1) create_backup projeto; pause ;;
+      2) restore_backup projeto; pause ;;
+      3) import_zsh_modules_to_project; pause ;;
+      4) show_detected_zsh_files; pause ;;
+      5)
+        echo "$PROJECT_DIR"
+        pause
+        ;;
+      0) return 0 ;;
+      *) warn "Invalid option."; pause ;;
+    esac
+  done
+}
+
+main_menu() {
+  while true; do
+    header
+
+    cat <<'EOF'
+1) Backup
+2) Restoration
+3) Installation
+4) ArchMind Project
+5) Show ArchMind directories
+6) Maintenance Center
+
+0) Exit
+EOF
+
+    echo
+    read -rp "Choice: " choice
+
+    case "$choice" in
+      1) backup_menu ;;
+      2) restore_menu ;;
+      3) install_menu ;;
+      4) project_menu ;;
+      5)
+        echo "Root:      $ROOT_DIR"
+        echo "Backups:   $BACKUP_DIR"
+        echo "Project:   $PROJECT_DIR"
+        echo "Safety:    $SAFETY_DIR"
+        pause
+        ;;
+      6) maintenance_menu ;;
+      0)
+        ok "Exiting."
+        exit 0
+        ;;
+      *)
+        warn "Invalid option."
+        pause
+        ;;
+    esac
+  done
+}
+
+main() {
+  require_normal_user
+  ensure_dirs
+  main_menu
+}
+
+main "$@"
