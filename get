@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+# ArchMind quick installer. Run as a normal user in a terminal.
+main() (
+    set -Eeuo pipefail
+    umask 077
+    if (( EUID == 0 )); then
+        printf '[ERROR] Run as your normal user, without sudo.\n' >&2
+        exit 1
+    fi
+    for dependency in curl sha256sum mktemp bash; do
+        command -v "$dependency" >/dev/null 2>&1 || {
+            printf '[ERROR] Missing command: %s\n' "$dependency" >&2
+            exit 1
+        }
+    done
+    if ! ( : </dev/tty ) 2>/dev/null; then
+        printf '[ERROR] Open a terminal or TTY to run the installer.\n' >&2
+        exit 1
+    fi
+    readonly version='1.5.18'
+    readonly checksum='9de5bcc1e7e243b74a80e676a7cf41188a11f57e23aac9efa8da98ba1b6990e9'
+    download_dir="$(mktemp -d -t archmind-download.XXXXXXXX)"
+    trap 'rm -rf -- "$download_dir"' EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM HUP
+    readonly installer="$download_dir/ArchMind-${version}-public-Installer.run"
+    printf '[INFO] Downloading ArchMind %s...\n' "$version"
+    curl --proto '=https' --tlsv1.2 -fL --retry 3 \
+        "https://github.com/K3nnobi/archmind/releases/download/v${version}/ArchMind-${version}-public-Installer.run" \
+        -o "$installer"
+    printf '%s  %s\n' "$checksum" "$installer" | sha256sum -c -
+    bash "$installer" --check
+    bash "$installer" </dev/tty
+)
+main "$@"

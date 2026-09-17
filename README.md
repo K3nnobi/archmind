@@ -27,6 +27,18 @@ validation details.
 
 ## Recommended installation
 
+Quick installation (as your normal user, without `sudo`):
+
+```bash
+curl -fsSL https://github.com/K3nnobi/archmind/raw/main/get | bash
+```
+
+The bootstrap downloads version 1.5.18, verifies its SHA-256 and starts the
+interactive installer. It also works from a TTY. Review [the bootstrap](get)
+before running it if you prefer.
+
+### Download and verify manually
+
 Download the single-file installer from the
 [1.5.18 public release](https://github.com/K3nnobi/archmind/releases/tag/v1.5.18).
 Run the following in a terminal on an installed Arch Linux system, as your
